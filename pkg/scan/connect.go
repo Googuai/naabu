@@ -5,7 +5,7 @@ import (
 	"net"
 
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/naabu/v2/pkg/port"
+	"github.com/Googuai/naabu/v2/pkg/port"
 )
 
 // ConnectVerify is used to verify if ports are accurate using a connect request

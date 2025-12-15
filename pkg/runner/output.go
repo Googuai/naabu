@@ -15,8 +15,8 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/naabu/v2/pkg/port"
-	"github.com/projectdiscovery/naabu/v2/pkg/protocol"
+	"github.com/Googuai/naabu/v2/pkg/port"
+	"github.com/Googuai/naabu/v2/pkg/protocol"
 	"github.com/projectdiscovery/utils/structs"
 )
 

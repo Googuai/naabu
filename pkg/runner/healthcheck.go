@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/projectdiscovery/goflags"
-	"github.com/projectdiscovery/naabu/v2/pkg/privileges"
+	"github.com/Googuai/naabu/v2/pkg/privileges"
 	fileutil "github.com/projectdiscovery/utils/file"
 )
 

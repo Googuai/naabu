@@ -10,11 +10,11 @@ import (
 	"github.com/logrusorgru/aurora"
 	_ "github.com/projectdiscovery/fdmax/autofdmax"
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/naabu/v2/internal/pdcp"
-	"github.com/projectdiscovery/naabu/v2/pkg/port"
-	"github.com/projectdiscovery/naabu/v2/pkg/protocol"
-	"github.com/projectdiscovery/naabu/v2/pkg/result"
-	"github.com/projectdiscovery/naabu/v2/pkg/runner"
+	"github.com/Googuai/naabu/v2/internal/pdcp"
+	"github.com/Googuai/naabu/v2/pkg/port"
+	"github.com/Googuai/naabu/v2/pkg/protocol"
+	"github.com/Googuai/naabu/v2/pkg/result"
+	"github.com/Googuai/naabu/v2/pkg/runner"
 	pdcpauth "github.com/projectdiscovery/utils/auth/pdcp"
 )
 

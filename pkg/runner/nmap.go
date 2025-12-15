@@ -7,9 +7,9 @@ import (
 
 	"github.com/Ullaakut/nmap/v3"
 	"github.com/projectdiscovery/gologger"
-	"github.com/projectdiscovery/naabu/v2/pkg/port"
-	"github.com/projectdiscovery/naabu/v2/pkg/protocol"
-	"github.com/projectdiscovery/naabu/v2/pkg/result"
+	"github.com/Googuai/naabu/v2/pkg/port"
+	"github.com/Googuai/naabu/v2/pkg/protocol"
+	"github.com/Googuai/naabu/v2/pkg/result"
 )
 
 func (r *Runner) handleNmap() error {
