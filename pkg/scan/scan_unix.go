@@ -11,15 +11,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Googuai/naabu/v2/pkg/port"
+	"github.com/Googuai/naabu/v2/pkg/privileges"
+	"github.com/Googuai/naabu/v2/pkg/protocol"
+	"github.com/Googuai/naabu/v2/pkg/routing"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/pcap"
 	"github.com/projectdiscovery/freeport"
 	"github.com/projectdiscovery/gologger"
-	"github.com/Googuai/naabu/v2/pkg/port"
-	"github.com/Googuai/naabu/v2/pkg/privileges"
-	"github.com/Googuai/naabu/v2/pkg/protocol"
-	"github.com/Googuai/naabu/v2/pkg/routing"
 	iputil "github.com/projectdiscovery/utils/ip"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -28,83 +28,15 @@ import (
 
 // ========== 新增/调整核心常量（解决协程数/超时问题） ==========
 const (
-	packetSendSize     = 10000
-	chanSize           = 10000
-	maxRetries         = 3
-	sendDelayMsec      = 1
-	snaplen            = 1500
-	readTimeoutMs      = 500  // pcap阻塞超时：500ms（平衡CPU和响应速度）
-	readSleepMs        = 10   // 非阻塞读休眠时间：10ms
-	ProtocolICMP       = 1    // ICMP协议号
-	ProtocolIPv6ICMP   = 58   // IPv6 ICMP协议号
+	readTimeoutMs = 500 // pcap阻塞超时：500ms（平衡CPU和响应速度）
+	readSleepMs   = 10  // 非阻塞读休眠时间：10ms
 )
-
-// 协程数 = CPU核心数（避免过度切换）
-var NumberOfHandlers = runtime.NumCPU()
 
 // ========== 原有全局变量保留 ==========
 var (
-	handlers      *Handlers
-	icmpConn4     *icmp.PacketConn
-	icmpConn6     *icmp.PacketConn
-	transportPacketSend chan *PkgSend
-	icmpPacketSend      chan *PkgSend
-	ethernetPacketSend  chan *PkgSend
-	ListenHandlers      []*ListenHandler
-	PkgRouter           *routing.Router
-	networkInterface    *net.Interface
-	tcpsequencer        = &port.Sequencer{}
+	handlers *Handlers
 )
 
-// 补充缺失的结构体定义（原代码可能在其他文件，此处补全）
-type PkgFlag int
-const (
-	Syn PkgFlag = iota
-	Ack
-	IcmpEchoRequest
-	IcmpTimestampRequest
-	IcmpAddressMaskRequest
-	Ndp
-	Arp
-)
-type PkgSend struct {
-	ListenHandler *ListenHandler
-	ip            string
-	port          *port.Port
-	flag          PkgFlag
-}
-type PkgResult struct {
-	ipv4 string
-	ipv6 string
-	port *port.Port
-}
-type ListenHandler struct {
-	Port             int
-	SourceIp4        net.IP
-	SourceHW         net.HardwareAddr
-	SourceIP6        net.IP
-	TcpConn4         net.PacketConn
-	TcpConn6         net.PacketConn
-	UdpConn4         net.PacketConn
-	UdpConn6         net.PacketConn
-	TcpChan          chan *PkgResult
-	UdpChan          chan *PkgResult
-	HostDiscoveryChan chan *PkgResult
-	Phase            struct{ Is func(int) bool } // 简化Phase逻辑，保留原有接口
-}
-func NewListenHandler() *ListenHandler {
-	return &ListenHandler{
-		TcpChan:          make(chan *PkgResult, chanSize),
-		UdpChan:          make(chan *PkgResult, chanSize),
-		HostDiscoveryChan: make(chan *PkgResult, chanSize),
-	}
-}
-func ToString(ip net.IP) string {
-	if ip == nil {
-		return ""
-	}
-	return ip.String()
-}
 // Handlers contains the list of pcap handlers
 type Handlers struct {
 	InterfaceHandle   map[string]*pcap.Handle
@@ -622,8 +554,8 @@ func (l *ListenHandler) TcpReadWorker4() {
 		n, addr, err := l.TcpConn4.ReadFrom(data)
 		if err != nil {
 			// 处理非阻塞错误：休眠后重试
-			if strings.Contains(strings.ToLower(err.Error()), "eagain") || 
-			   strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
+			if strings.Contains(strings.ToLower(err.Error()), "eagain") ||
+				strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
 				time.Sleep(readSleepMs * time.Millisecond)
 				continue
 			}
@@ -669,8 +601,8 @@ func (l *ListenHandler) TcpReadWorker6() {
 	for {
 		n, addr, err := l.TcpConn6.ReadFrom(data)
 		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "eagain") || 
-			   strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
+			if strings.Contains(strings.ToLower(err.Error()), "eagain") ||
+				strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
 				time.Sleep(readSleepMs * time.Millisecond)
 				continue
 			}
@@ -719,8 +651,8 @@ func (l *ListenHandler) UdpReadWorker4() {
 
 		n, addr, err := l.UdpConn4.ReadFrom(data)
 		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "eagain") || 
-			   strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
+			if strings.Contains(strings.ToLower(err.Error()), "eagain") ||
+				strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
 				time.Sleep(readSleepMs * time.Millisecond)
 				continue
 			}
@@ -763,8 +695,8 @@ func (l *ListenHandler) UdpReadWorker6() {
 	for {
 		n, addr, err := l.UdpConn6.ReadFrom(data)
 		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "eagain") || 
-			   strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
+			if strings.Contains(strings.ToLower(err.Error()), "eagain") ||
+				strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
 				time.Sleep(readSleepMs * time.Millisecond)
 				continue
 			}
@@ -797,6 +729,7 @@ func (l *ListenHandler) UdpReadWorker6() {
 		}
 	}
 }
+
 // SetupHandlerUnix on unix OS
 // SetupHandlerUnix 优化版：固定合理的超时配置
 func SetupHandlerUnix(interfaceName, bpfFilter string, protocols ...protocol.Protocol) error {
