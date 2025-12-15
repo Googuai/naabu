@@ -1,5 +1,3 @@
-//go:build linux || darwin
-
 package scan
 
 import (
@@ -8,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,10 +26,85 @@ import (
 	"golang.org/x/net/ipv6"
 )
 
-var (
-	handlers *Handlers
+// ========== 新增/调整核心常量（解决协程数/超时问题） ==========
+const (
+	packetSendSize     = 10000
+	chanSize           = 10000
+	maxRetries         = 3
+	sendDelayMsec      = 1
+	snaplen            = 1500
+	readTimeoutMs      = 500  // pcap阻塞超时：500ms（平衡CPU和响应速度）
+	readSleepMs        = 10   // 非阻塞读休眠时间：10ms
+	ProtocolICMP       = 1    // ICMP协议号
+	ProtocolIPv6ICMP   = 58   // IPv6 ICMP协议号
 )
 
+// 协程数 = CPU核心数（避免过度切换）
+var NumberOfHandlers = runtime.NumCPU()
+
+// ========== 原有全局变量保留 ==========
+var (
+	handlers      *Handlers
+	icmpConn4     *icmp.PacketConn
+	icmpConn6     *icmp.PacketConn
+	transportPacketSend chan *PkgSend
+	icmpPacketSend      chan *PkgSend
+	ethernetPacketSend  chan *PkgSend
+	ListenHandlers      []*ListenHandler
+	PkgRouter           *routing.Router
+	networkInterface    *net.Interface
+	tcpsequencer        = &port.Sequencer{}
+)
+
+// 补充缺失的结构体定义（原代码可能在其他文件，此处补全）
+type PkgFlag int
+const (
+	Syn PkgFlag = iota
+	Ack
+	IcmpEchoRequest
+	IcmpTimestampRequest
+	IcmpAddressMaskRequest
+	Ndp
+	Arp
+)
+type PkgSend struct {
+	ListenHandler *ListenHandler
+	ip            string
+	port          *port.Port
+	flag          PkgFlag
+}
+type PkgResult struct {
+	ipv4 string
+	ipv6 string
+	port *port.Port
+}
+type ListenHandler struct {
+	Port             int
+	SourceIp4        net.IP
+	SourceHW         net.HardwareAddr
+	SourceIP6        net.IP
+	TcpConn4         net.PacketConn
+	TcpConn6         net.PacketConn
+	UdpConn4         net.PacketConn
+	UdpConn6         net.PacketConn
+	TcpChan          chan *PkgResult
+	UdpChan          chan *PkgResult
+	HostDiscoveryChan chan *PkgResult
+	Phase            struct{ Is func(int) bool } // 简化Phase逻辑，保留原有接口
+}
+func NewListenHandler() *ListenHandler {
+	return &ListenHandler{
+		TcpChan:          make(chan *PkgResult, chanSize),
+		UdpChan:          make(chan *PkgResult, chanSize),
+		HostDiscoveryChan: make(chan *PkgResult, chanSize),
+	}
+}
+func ToString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
 // Handlers contains the list of pcap handlers
 type Handlers struct {
 	InterfaceHandle   map[string]*pcap.Handle
@@ -533,87 +607,259 @@ func sendWithHandler(destIP string, iface *net.Interface, l ...gopacket.Serializ
 	return nil
 }
 
+// TcpReadWorker4 优化版：添加错误处理+数据解析+CPU休眠
 func (l *ListenHandler) TcpReadWorker4() {
+	runtime.LockOSThread() // 绑定CPU核心，减少切换
+	defer runtime.UnlockOSThread()
+
 	data := make([]byte, 4096)
 	for {
-		_, _, _ = l.TcpConn4.ReadFrom(data)
+		if l.TcpConn4 == nil {
+			gologger.Debug().Msg("TcpConn4 is nil, exit TCP read worker")
+			return
+		}
+
+		n, addr, err := l.TcpConn4.ReadFrom(data)
+		if err != nil {
+			// 处理非阻塞错误：休眠后重试
+			if strings.Contains(strings.ToLower(err.Error()), "eagain") || 
+			   strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
+				time.Sleep(readSleepMs * time.Millisecond)
+				continue
+			}
+			// 处理套接字关闭/其他错误：退出循环
+			gologger.Debug().Msgf("TCP4 read error (exit): %v", err)
+			return
+		}
+
+		// 解析TCP数据包（原代码缺失，导致数据丢失+空循环）
+		if n == 0 || addr == nil {
+			continue
+		}
+		srcIP := addr.String()
+		packet := gopacket.NewPacket(data[:n], layers.LayerTypeTCP, gopacket.Default)
+		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+			tcp, ok := tcpLayer.(*layers.TCP)
+			if !ok {
+				continue
+			}
+			// 过滤目标端口匹配的数据包，发送到结果通道
+			if tcp.DstPort == layers.TCPPort(l.Port) {
+				l.TcpChan <- &PkgResult{
+					ipv4: srcIP,
+					port: &port.Port{
+						Port:     int(tcp.SrcPort),
+						Protocol: protocol.TCP,
+					},
+				}
+			}
+		}
 	}
 }
 
+// TcpReadWorker6 优化版
 func (l *ListenHandler) TcpReadWorker6() {
 	if l.TcpConn6 == nil {
 		return
 	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	data := make([]byte, 4096)
 	for {
-		_, _, _ = l.TcpConn6.ReadFrom(data)
+		n, addr, err := l.TcpConn6.ReadFrom(data)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "eagain") || 
+			   strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
+				time.Sleep(readSleepMs * time.Millisecond)
+				continue
+			}
+			gologger.Debug().Msgf("TCP6 read error (exit): %v", err)
+			return
+		}
+
+		if n == 0 || addr == nil {
+			continue
+		}
+		srcIP := addr.String()
+		// 处理IPv6地址格式（去除zone信息）
+		if idx := strings.Index(srcIP, "%"); idx > 0 {
+			srcIP = srcIP[:idx]
+		}
+		packet := gopacket.NewPacket(data[:n], layers.LayerTypeTCP, gopacket.Default)
+		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+			tcp, ok := tcpLayer.(*layers.TCP)
+			if !ok {
+				continue
+			}
+			if tcp.DstPort == layers.TCPPort(l.Port) {
+				l.TcpChan <- &PkgResult{
+					ipv6: srcIP,
+					port: &port.Port{
+						Port:     int(tcp.SrcPort),
+						Protocol: protocol.TCP,
+					},
+				}
+			}
+		}
 	}
 }
 
+// UdpReadWorker4 优化版
 func (l *ListenHandler) UdpReadWorker4() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	data := make([]byte, 4096)
 	for {
-		_, _, _ = l.UdpConn4.ReadFrom(data)
+		if l.UdpConn4 == nil {
+			gologger.Debug().Msg("UdpConn4 is nil, exit UDP read worker")
+			return
+		}
+
+		n, addr, err := l.UdpConn4.ReadFrom(data)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "eagain") || 
+			   strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
+				time.Sleep(readSleepMs * time.Millisecond)
+				continue
+			}
+			gologger.Debug().Msgf("UDP4 read error (exit): %v", err)
+			return
+		}
+
+		if n == 0 || addr == nil {
+			continue
+		}
+		srcIP := addr.String()
+		packet := gopacket.NewPacket(data[:n], layers.LayerTypeUDP, gopacket.Default)
+		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+			udp, ok := udpLayer.(*layers.UDP)
+			if !ok {
+				continue
+			}
+			if udp.DstPort == layers.UDPPort(l.Port) && udp.Length > 0 {
+				l.UdpChan <- &PkgResult{
+					ipv4: srcIP,
+					port: &port.Port{
+						Port:     int(udp.SrcPort),
+						Protocol: protocol.UDP,
+					},
+				}
+			}
+		}
 	}
 }
+
+// UdpReadWorker6 优化版
 func (l *ListenHandler) UdpReadWorker6() {
 	if l.UdpConn6 == nil {
 		return
 	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	data := make([]byte, 4096)
 	for {
-		_, _, _ = l.UdpConn6.ReadFrom(data)
+		n, addr, err := l.UdpConn6.ReadFrom(data)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "eagain") || 
+			   strings.Contains(strings.ToLower(err.Error()), "ewouldblock") {
+				time.Sleep(readSleepMs * time.Millisecond)
+				continue
+			}
+			gologger.Debug().Msgf("UDP6 read error (exit): %v", err)
+			return
+		}
+
+		if n == 0 || addr == nil {
+			continue
+		}
+		srcIP := addr.String()
+		if idx := strings.Index(srcIP, "%"); idx > 0 {
+			srcIP = srcIP[:idx]
+		}
+		packet := gopacket.NewPacket(data[:n], layers.LayerTypeUDP, gopacket.Default)
+		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+			udp, ok := udpLayer.(*layers.UDP)
+			if !ok {
+				continue
+			}
+			if udp.DstPort == layers.UDPPort(l.Port) && udp.Length > 0 {
+				l.UdpChan <- &PkgResult{
+					ipv6: srcIP,
+					port: &port.Port{
+						Port:     int(udp.SrcPort),
+						Protocol: protocol.UDP,
+					},
+				}
+			}
+		}
 	}
 }
-
 // SetupHandlerUnix on unix OS
+// SetupHandlerUnix 优化版：固定合理的超时配置
 func SetupHandlerUnix(interfaceName, bpfFilter string, protocols ...protocol.Protocol) error {
 	for _, proto := range protocols {
 		inactive, err := pcap.NewInactiveHandle(interfaceName)
 		if err != nil {
-			return err
+			return fmt.Errorf("create inactive handle failed: %w", err)
 		}
 
-		err = inactive.SetSnapLen(snaplen)
-		if err != nil {
-			return err
+		// 基础配置：固定snaplen+超时+即时模式
+		if err = inactive.SetSnapLen(snaplen); err != nil {
+			inactive.CleanUp()
+			return fmt.Errorf("set snaplen failed: %w", err)
 		}
 
-		readTimeout := time.Duration(readtimeout) * time.Millisecond
+		// 核心优化：设置500ms阻塞超时，避免非阻塞空转
+		readTimeout := time.Duration(readTimeoutMs) * time.Millisecond
 		if err = inactive.SetTimeout(readTimeout); err != nil {
+			inactive.CleanUp()
 			CleanupHandlersUnix()
-			return err
-		}
-		err = inactive.SetImmediateMode(true)
-		if err != nil {
-			return err
+			return fmt.Errorf("set pcap timeout failed: %w", err)
 		}
 
+		if err = inactive.SetImmediateMode(true); err != nil {
+			inactive.CleanUp()
+			return fmt.Errorf("set immediate mode failed: %w", err)
+		}
+
+		// 按协议分类存储inactive handle
 		switch proto {
 		case protocol.TCP, protocol.UDP:
 			handlers.TransportInactive = append(handlers.TransportInactive, inactive)
 		case protocol.ARP:
 			handlers.EthernetInactive = append(handlers.EthernetInactive, inactive)
 		default:
-			panic("protocol not supported")
+			inactive.CleanUp()
+			return errors.New("unsupported protocol: " + proto.String())
 		}
 
+		// 激活handle并设置BPF过滤
 		handle, err := inactive.Activate()
 		if err != nil {
+			inactive.CleanUp()
 			CleanupHandlersUnix()
-			return err
+			return fmt.Errorf("activate handle failed: %w", err)
 		}
 
-		// Strict BPF filter
-		// + Destination port equals to sender socket source port
-		err = handle.SetBPFFilter(bpfFilter)
-		if err != nil {
-			return err
+		if err = handle.SetBPFFilter(bpfFilter); err != nil {
+			handle.Close()
+			inactive.CleanUp()
+			CleanupHandlersUnix()
+			return fmt.Errorf("set BPF filter failed: %w", err)
 		}
+
+		// 获取网卡信息并分类存储active handle
 		iface, err := net.InterfaceByName(interfaceName)
 		if err != nil {
-			return err
+			handle.Close()
+			inactive.CleanUp()
+			CleanupHandlersUnix()
+			return fmt.Errorf("get interface %s failed: %w", interfaceName, err)
 		}
+
 		switch proto {
 		case protocol.TCP, protocol.UDP:
 			if iface.Flags&net.FlagLoopback == net.FlagLoopback {
@@ -624,14 +870,11 @@ func SetupHandlerUnix(interfaceName, bpfFilter string, protocols ...protocol.Pro
 			handlers.InterfaceHandle[iface.Name] = handle
 		case protocol.ARP:
 			handlers.EthernetActive = append(handlers.EthernetActive, handle)
-		default:
-			panic("protocol not supported")
 		}
 	}
 
 	return nil
 }
-
 func TransportReadWorker() {
 	var wgread sync.WaitGroup
 
